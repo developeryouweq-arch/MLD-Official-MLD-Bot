@@ -3,6 +3,9 @@ const {
     GatewayIntentBits,
     SlashCommandBuilder,
     EmbedBuilder,
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
     ChannelType,
     ThreadAutoArchiveDuration
 } = require('discord.js');
@@ -13,9 +16,13 @@ const LEAGUE_CHANNEL_ID   = '1483021640504709202';
 const LEAGUE_HOST_ROLE_ID = '1483021638693032032';
 const LEAGUES_PING_ROLE   = '1483021638185254921';
 
+// Bad words ONLY — no link detection, no other filters
 const BAD_WORDS = [
-    'nigga', 'nigger', 'fuck', 'f*ck', 'shit', 'bitch', 'cunt',
-    'faggot', 'fag', 'retard', 'slut', 'whore', 'bastard', 'ass'
+    'nigga', 'nigger', 'fuck', 'f*ck', 'fuk', 'fvck',
+    'shit', 'sh1t', 'bitch', 'b1tch', 'cunt', 'c*nt',
+    'faggot', 'fag', 'f*g', 'retard', 'slut', 'sl*t',
+    'whore', 'wh*re', 'bastard', 'motherfucker', 'cock',
+    'dick', 'pussy', 'asshole', 'a**hole'
 ];
 
 // ─── Database ──────────────────────────────────────────────────────────────────
@@ -28,7 +35,7 @@ function loadDB() {
             fs.writeFileSync(DB_PATH, JSON.stringify(fresh, null, 2));
             return fresh;
         }
-        const raw = fs.readFileSync(DB_PATH, 'utf8');
+        const raw  = fs.readFileSync(DB_PATH, 'utf8');
         const data = JSON.parse(raw);
         if (!data.leagues)  data.leagues  = {};
         if (!data.warnings) data.warnings = {};
@@ -76,29 +83,41 @@ function displayRegion(region) {
 }
 
 function buildLeagueEmbed(league, full = false) {
-    const spots = league.maxPlayers - league.players.length;
+    const spots      = league.maxPlayers - league.players.length;
     const playerList = league.players.map(p => `<@${p}>`).join('\n') || 'None';
 
-    return new EmbedBuilder()
-        .setColor(0x1a1a2e)
-        .setTitle(full ? `LEAGUE ${league.id}  -  FULL` : `LEAGUE ${league.id}`)
+    const embed = new EmbedBuilder()
+        .setColor(full ? 0x2e2e2e : 0x1a1a2e)
+        .setTitle(full ? `LEAGUE ${league.id}  —  CLOSED` : `LEAGUE ${league.id}  —  OPEN`)
         .setDescription(
             full
-                ? 'The league is full and has started. Players have been moved to a private thread.'
-                : `Use \`/league join id:${league.id}\` to claim a spot.`
+                ? 'This league is full. Participants have been moved to a private thread.'
+                : `Press the button below to join this league.`
         )
         .addFields(
-            { name: 'GAME TYPE',  value: displayType(league.type),     inline: true },
-            { name: 'FORMAT',     value: league.format.toUpperCase(),   inline: true },
-            { name: 'PERKS',      value: displayPerks(league.perks),    inline: true },
-            { name: 'REGION',     value: displayRegion(league.region),  inline: true },
-            { name: 'HOST',       value: `<@${league.hostId}>`,         inline: true },
-            { name: 'SPOTS LEFT', value: `${spots} / ${league.maxPlayers}`, inline: true },
-            { name: 'PLAYERS',    value: playerList,                    inline: false },
-            { name: 'LEAGUE ID',  value: `\`${league.id}\``,            inline: true }
+            { name: 'GAME TYPE',  value: displayType(league.type),              inline: true },
+            { name: 'FORMAT',     value: league.format.toUpperCase(),            inline: true },
+            { name: 'PERKS',      value: displayPerks(league.perks),             inline: true },
+            { name: 'REGION',     value: displayRegion(league.region),           inline: true },
+            { name: 'HOST',       value: `<@${league.hostId}>`,                  inline: true },
+            { name: 'SPOTS LEFT', value: `${spots} / ${league.maxPlayers}`,      inline: true },
+            { name: 'PLAYERS',    value: playerList,                             inline: false },
+            { name: 'LEAGUE ID',  value: `\`${league.id}\``,                    inline: true }
         )
-        .setFooter({ text: full ? 'League is now closed.' : `Cancel with /league cancel id:${league.id}` })
+        .setFooter({ text: full ? 'League is now closed.' : `Cancel: /league cancel id:${league.id}` })
         .setTimestamp();
+
+    return embed;
+}
+
+function buildJoinRow(leagueId, disabled = false) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`league_join_${leagueId}`)
+            .setLabel(disabled ? 'LEAGUE FULL' : 'JOIN LEAGUE')
+            .setStyle(disabled ? ButtonStyle.Secondary : ButtonStyle.Primary)
+            .setDisabled(disabled)
+    );
 }
 
 // ─── Client ────────────────────────────────────────────────────────────────────
@@ -157,12 +176,6 @@ client.once('ready', async () => {
                     .addStringOption(o =>
                         o.setName('id').setDescription('League ID').setRequired(true)
                     ))
-            .addSubcommand(sub =>
-                sub.setName('join')
-                    .setDescription('Join an active league')
-                    .addStringOption(o =>
-                        o.setName('id').setDescription('League ID').setRequired(true)
-                    ))
     ];
 
     try {
@@ -172,9 +185,9 @@ client.once('ready', async () => {
         console.error('Command registration failed:', err);
     }
 
-    // ── Timed-ban expiry check (runs every 10 minutes) ──────────────────────────
+    // ── Timed-ban expiry check every 10 minutes ─────────────────────────────────
     setInterval(async () => {
-        const db = loadDB();
+        const db  = loadDB();
         const now = Date.now();
         let changed = false;
 
@@ -196,8 +209,114 @@ client.once('ready', async () => {
     }, 10 * 60 * 1000);
 });
 
-// ─── Interactions ──────────────────────────────────────────────────────────────
+// ─── Slash command interactions ────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
+
+    // ── BUTTON: Join League ──────────────────────────────────────────────────────
+    if (interaction.isButton()) {
+        if (!interaction.customId.startsWith('league_join_')) return;
+
+        await interaction.deferReply({ ephemeral: true });
+
+        const leagueId = interaction.customId.replace('league_join_', '');
+        const db       = loadDB();
+        const league   = db.leagues[leagueId];
+
+        if (!league)                                        return interaction.editReply('This league no longer exists.');
+        if (league.status !== 'open')                       return interaction.editReply('This league is no longer accepting players.');
+        if (league.players.includes(interaction.user.id))  return interaction.editReply('You are already in this league.');
+        if (league.players.length >= league.maxPlayers)    return interaction.editReply('This league is full.');
+
+        league.players.push(interaction.user.id);
+
+        // ── League is now full — open the private thread ─────────────────────────
+        if (league.players.length >= league.maxPlayers) {
+            league.status = 'full';
+
+            try {
+                const leagueChannel = await interaction.guild.channels.fetch(league.channelId);
+
+                // Create the private thread
+                const thread = await leagueChannel.threads.create({
+                    name:                `League ${leagueId} — ${displayType(league.type)}`,
+                    autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
+                    type:                ChannelType.PrivateThread,
+                    invitable:           false,
+                    reason:              `League ${leagueId} is full — starting`
+                });
+
+                league.threadId = thread.id;
+                saveDB(db);
+
+                // Add every participant to the private thread
+                for (const playerId of league.players) {
+                    try { await thread.members.add(playerId); } catch (_) {}
+                }
+
+                const playerMentions = league.players.map(p => `<@${p}>`).join('\n');
+
+                const startEmbed = new EmbedBuilder()
+                    .setColor(0x1a1a2e)
+                    .setTitle(`LEAGUE ${leagueId}  —  ACTIVE`)
+                    .setDescription(
+                        'The league is now full. Only participants can see this thread.\n' +
+                        'Coordinate your match here. Good luck.'
+                    )
+                    .addFields(
+                        { name: 'GAME TYPE', value: displayType(league.type),     inline: true },
+                        { name: 'FORMAT',    value: league.format.toUpperCase(),  inline: true },
+                        { name: 'PERKS',     value: displayPerks(league.perks),   inline: true },
+                        { name: 'REGION',    value: displayRegion(league.region), inline: true },
+                        { name: 'HOST',      value: `<@${league.hostId}>`,        inline: true },
+                        { name: '\u200b',    value: '\u200b',                     inline: true },
+                        { name: 'PLAYERS',   value: playerMentions,               inline: false }
+                    )
+                    .setTimestamp();
+
+                await thread.send({
+                    content: league.players.map(p => `<@${p}>`).join(' '),
+                    embeds:  [startEmbed]
+                });
+
+                console.log(`Private thread created for league ${leagueId}: ${thread.id}`);
+            } catch (e) {
+                console.error('Thread creation failed:', e);
+            }
+
+            // Update the public embed — disable the button
+            try {
+                const ch  = await interaction.guild.channels.fetch(league.channelId);
+                const msg = await ch.messages.fetch(league.messageId);
+                if (msg) {
+                    await msg.edit({
+                        embeds:     [buildLeagueEmbed(league, true)],
+                        components: [buildJoinRow(leagueId, true)]
+                    });
+                }
+            } catch (_) {}
+
+            saveDB(db);
+            return interaction.editReply('You have joined the league. The league is now full — check the private thread that has been opened for you.');
+        }
+
+        // ── Not full yet — update embed with new player count ────────────────────
+        saveDB(db);
+
+        try {
+            const ch  = await interaction.guild.channels.fetch(league.channelId);
+            const msg = await ch.messages.fetch(league.messageId);
+            if (msg) {
+                await msg.edit({
+                    embeds:     [buildLeagueEmbed(league)],
+                    components: [buildJoinRow(leagueId)]
+                });
+            }
+        } catch (_) {}
+
+        return interaction.editReply(`You have joined league \`${leagueId}\`. ${league.maxPlayers - league.players.length} spot(s) remaining.`);
+    }
+
+    // ── SLASH COMMANDS ───────────────────────────────────────────────────────────
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== 'league') return;
 
@@ -206,7 +325,7 @@ client.on('interactionCreate', async (interaction) => {
     const sub = interaction.options.getSubcommand();
     const db  = loadDB();
 
-    // ── HOST ────────────────────────────────────────────────────────────────────
+    // ── HOST ─────────────────────────────────────────────────────────────────────
     if (sub === 'host') {
         if (interaction.channelId !== LEAGUE_CHANNEL_ID) {
             return interaction.editReply('Leagues can only be hosted in <#1483021640504709202>.');
@@ -245,17 +364,18 @@ client.on('interactionCreate', async (interaction) => {
         const league = db.leagues[id];
 
         const posted = await interaction.channel.send({
-            content:  `<@&${LEAGUES_PING_ROLE}>`,
-            embeds:   [buildLeagueEmbed(league)]
+            content:    `<@&${LEAGUES_PING_ROLE}>`,
+            embeds:     [buildLeagueEmbed(league)],
+            components: [buildJoinRow(id)]
         });
 
         db.leagues[id].messageId = posted.id;
         saveDB(db);
 
-        return interaction.editReply(`League \`${id}\` created successfully.`);
+        return interaction.editReply(`League \`${id}\` has been created. Members can now join using the button on the post.`);
     }
 
-    // ── CANCEL ──────────────────────────────────────────────────────────────────
+    // ── CANCEL ───────────────────────────────────────────────────────────────────
     if (sub === 'cancel') {
         const id     = interaction.options.getString('id').toUpperCase();
         const league = db.leagues[id];
@@ -271,6 +391,7 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.editReply('You do not have permission to cancel this league.');
         }
 
+        // Delete private thread if it exists
         if (league.threadId) {
             try {
                 const thread = await interaction.guild.channels.fetch(league.threadId);
@@ -278,6 +399,7 @@ client.on('interactionCreate', async (interaction) => {
             } catch (_) {}
         }
 
+        // Delete the public embed
         if (league.messageId) {
             try {
                 const ch  = await interaction.guild.channels.fetch(league.channelId);
@@ -289,89 +411,18 @@ client.on('interactionCreate', async (interaction) => {
         delete db.leagues[id];
         saveDB(db);
 
-        return interaction.editReply(`League \`${id}\` has been cancelled.`);
-    }
-
-    // ── JOIN ────────────────────────────────────────────────────────────────────
-    if (sub === 'join') {
-        const id     = interaction.options.getString('id').toUpperCase();
-        const league = db.leagues[id];
-
-        if (!league)                                    return interaction.editReply(`No active league found with ID \`${id}\`.`);
-        if (league.status !== 'open')                   return interaction.editReply('This league is no longer accepting players.');
-        if (league.players.includes(interaction.user.id)) return interaction.editReply('You are already in this league.');
-        if (league.players.length >= league.maxPlayers) return interaction.editReply('This league is full.');
-
-        league.players.push(interaction.user.id);
-
-        // ── League is now full — start it ────────────────────────────────────────
-        if (league.players.length >= league.maxPlayers) {
-            league.status = 'full';
-
-            try {
-                const leagueChannel = await interaction.guild.channels.fetch(league.channelId);
-
-                const thread = await leagueChannel.threads.create({
-                    name:                `League ${id} - ${displayType(league.type)}`,
-                    autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
-                    type:                ChannelType.PrivateThread,
-                    reason:              `League ${id} started`
-                });
-
-                league.threadId = thread.id;
-
-                for (const playerId of league.players) {
-                    try { await thread.members.add(playerId); } catch (_) {}
-                }
-
-                const playerList = league.players.map(p => `<@${p}>`).join('\n');
-
-                const startEmbed = new EmbedBuilder()
-                    .setColor(0x1a1a2e)
-                    .setTitle(`LEAGUE ${id}  -  ACTIVE`)
-                    .setDescription('The league is full. All participants have been added to this thread. Good luck.')
-                    .addFields(
-                        { name: 'GAME TYPE', value: displayType(league.type),    inline: true },
-                        { name: 'FORMAT',    value: league.format.toUpperCase(), inline: true },
-                        { name: 'PERKS',     value: displayPerks(league.perks),  inline: true },
-                        { name: 'REGION',    value: displayRegion(league.region),inline: true },
-                        { name: 'HOST',      value: `<@${league.hostId}>`,       inline: true },
-                        { name: 'PLAYERS',   value: playerList,                  inline: false }
-                    )
-                    .setTimestamp();
-
-                await thread.send({ embeds: [startEmbed] });
-            } catch (e) {
-                console.error('Thread creation failed:', e);
-            }
-
-            // Update public embed to show league is full
-            try {
-                const ch  = await interaction.guild.channels.fetch(league.channelId);
-                const msg = await ch.messages.fetch(league.messageId);
-                if (msg) await msg.edit({ embeds: [buildLeagueEmbed(league, true)] });
-            } catch (_) {}
-        } else {
-            // Update public embed with new player count
-            try {
-                const ch  = await interaction.guild.channels.fetch(league.channelId);
-                const msg = await ch.messages.fetch(league.messageId);
-                if (msg) await msg.edit({ embeds: [buildLeagueEmbed(league)] });
-            } catch (_) {}
-        }
-
-        saveDB(db);
-        return interaction.editReply(`You have joined league \`${id}\`. ${league.status === 'full' ? 'The league is now full — check the private thread.' : ''}`);
+        return interaction.editReply(`League \`${id}\` has been cancelled and removed.`);
     }
 });
 
-// ─── Automod ───────────────────────────────────────────────────────────────────
+// ─── Automod — bad words only ──────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (!message.guild)     return;
     if (!message.member)    return;
 
-    const content = message.content.toLowerCase().replace(/[*_~`|]/g, '');
+    // Strip markdown formatting characters, then check for bad words only
+    const content   = message.content.toLowerCase().replace(/[*_~`|\\]/g, '');
     const triggered = BAD_WORDS.some(word => content.includes(word));
 
     if (!triggered) return;
@@ -387,15 +438,15 @@ client.on('messageCreate', async (message) => {
     const total = db.warnings[userId];
     saveDB(db);
 
-    // ── Warning notification ─────────────────────────────────────────────────────
+    // Warning notice — auto-deletes after 8 seconds
     const warnEmbed = new EmbedBuilder()
         .setColor(0x1a1a2e)
-        .setTitle('AUTOMOD  -  WARNING ISSUED')
+        .setTitle('AUTOMOD  —  WARNING ISSUED')
         .setDescription(`${message.author} — your message contained prohibited language and has been removed.`)
         .addFields(
-            { name: 'TOTAL WARNINGS', value: `${total}`, inline: true },
-            { name: 'KICK THRESHOLD', value: '10',       inline: true },
-            { name: 'BAN THRESHOLD',  value: '30',       inline: true }
+            { name: 'WARNINGS',       value: `${total}`,  inline: true },
+            { name: 'KICK AT',        value: '10',         inline: true },
+            { name: 'BAN AT',         value: '30',         inline: true }
         )
         .setTimestamp();
 
@@ -405,12 +456,16 @@ client.on('messageCreate', async (message) => {
     // ── 10 warnings → kick ───────────────────────────────────────────────────────
     if (total === 10) {
         try {
-            await message.member.send('You have been kicked from the server for accumulating 10 warnings for prohibited language. You may rejoin, but further violations will result in a ban.').catch(() => {});
-            await message.member.kick('Automod: 10 warnings accumulated');
+            await message.member.send(
+                'You have been kicked from the server for accumulating 10 warnings for prohibited language. ' +
+                'You may rejoin, but further violations will result in a ban.'
+            ).catch(() => {});
+
+            await message.member.kick('Automod: 10 warnings');
 
             const kickEmbed = new EmbedBuilder()
                 .setColor(0x1a1a2e)
-                .setTitle('AUTOMOD  -  MEMBER KICKED')
+                .setTitle('AUTOMOD  —  MEMBER KICKED')
                 .setDescription(`**${message.author.tag}** was kicked for accumulating 10 warnings.`)
                 .setTimestamp();
 
@@ -427,12 +482,15 @@ client.on('messageCreate', async (message) => {
             db.bans[userId] = expiresAt;
             saveDB(db);
 
-            await message.member.send('You have been banned from the server for 3 days for accumulating 30 warnings for prohibited language.').catch(() => {});
+            await message.member.send(
+                'You have been banned from the server for 3 days for accumulating 30 warnings for prohibited language.'
+            ).catch(() => {});
+
             await message.member.ban({ reason: 'Automod: 30 warnings — 3-day ban', deleteMessageSeconds: 0 });
 
             const banEmbed = new EmbedBuilder()
                 .setColor(0x1a1a2e)
-                .setTitle('AUTOMOD  -  MEMBER BANNED (3 DAYS)')
+                .setTitle('AUTOMOD  —  MEMBER BANNED (3 DAYS)')
                 .setDescription(`**${message.author.tag}** has been banned for 3 days for accumulating 30 warnings.`)
                 .setTimestamp();
 
@@ -446,7 +504,7 @@ client.on('messageCreate', async (message) => {
 // ─── Login ─────────────────────────────────────────────────────────────────────
 const TOKEN = process.env.DISCORD_TOKEN;
 if (!TOKEN) {
-    console.error('DISCORD_TOKEN is not set. Add it as an environment variable.');
+    console.error('DISCORD_TOKEN is not set.');
     process.exit(1);
 }
 
